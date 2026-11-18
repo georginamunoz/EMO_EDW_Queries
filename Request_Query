@@ -1,0 +1,449 @@
+-- =====================================================================
+-- 1. Outgoing referral notes
+-- =====================================================================
+CREATE OR REPLACE TEMPORARY VIEW out_ref AS
+WITH data AS (
+    SELECT rn.request_id AS outgoing_referral_note_req_id,
+           rn.user_nm AS outgoing_referral_note_user_nm,
+           rn.user_role AS outgoing_referral_note_user_role,
+           CAST(rn.cst_note_entered_dtm AS DATE) AS outgoing_referral_note_date,
+           rn.note_part1 AS outgoing_referral_note,
+           ROW_NUMBER() OVER (PARTITION BY rn.request_id ORDER BY rn.cst_note_entered_dtm DESC) AS or_rn
+    FROM prod.emo_restricted.request_note rn
+         LEFT JOIN  prod.emo_restricted.request r ON r.request_id = rn.request_id
+         LEFT JOIN  prod.emo_edw.request_dtm_tracker rdt ON rdt.request_id = rn.request_id
+    WHERE rn.note_type = 'Outgoing referral'
+      AND CAST(r.cst_request_dtm AS DATE) >= '2023-01-01'
+)
+SELECT *
+FROM data
+WHERE or_rn = 1;
+
+
+-- =====================================================================
+-- 2. Notes / assignments
+-- =====================================================================
+CREATE OR REPLACE TEMPORARY VIEW notes AS
+WITH agg AS (
+    SELECT r.request_id AS notes_req_id,
+           MAX(CASE WHEN r.caller_user_id IS NOT NULL
+                      OR CASE WHEN rna.assign_user_role IN ('caller','caller_super') THEN CAST(rna.cst_assigned_dtm AS DATE) END IS NOT NULL
+                    THEN 1 ELSE 0 END) AS caller_ind,
+           MAX(NVL(r.caller_user_nm, CASE WHEN rna.assign_user_role IN ('caller','caller_super') THEN rna.assign_user_nm END)) AS caller_user_nm_req,
+           MAX(CASE WHEN r.intake_user_id IS NOT NULL
+                      OR CASE WHEN rna.assign_user_role IN ('intake','intake_super') THEN CAST(rna.cst_assigned_dtm AS DATE) END IS NOT NULL
+                    THEN 1 ELSE 0 END) AS intake_ind,
+           MAX(NVL(r.intake_user_nm, CASE WHEN rna.assign_user_role IN ('intake','intake_super') THEN rna.assign_user_nm END)) AS intake_user_nm_req,
+           MAX(CASE WHEN r.nurse_user_id IS NOT NULL
+                      OR CASE WHEN rna.assign_user_role IN ('mtm','careteam_superuser') THEN CAST(rna.cst_assigned_dtm AS DATE) END IS NOT NULL
+                    THEN 1 ELSE 0 END) AS nurse_ind,
+           MAX(CASE WHEN r.record_user_id IS NOT NULL
+                      OR CASE WHEN rna.assign_user_role IN ('rtm','rtm_superuser') THEN CAST(rna.cst_assigned_dtm AS DATE) END IS NOT NULL
+                    THEN 1 ELSE 0 END) AS record_ind,
+           MAX(CASE WHEN rna.assign_user_role IN ('pls','pls_nurse','pls_super') THEN 1 ELSE 0 END) AS pls_assign_ind,
+
+           MIN(CASE WHEN rna.assign_user_role IN ('mtm','careteam_superuser') THEN CAST(rna.cst_assigned_dtm AS DATE) END) AS first_nurse_assign_dt,
+           MAX(NVL(r.nurse_user_nm, CASE WHEN rna.assign_user_role IN ('mtm','careteam_superuser') THEN rna.assign_user_nm END)) AS nurse_user_nm,
+
+           MIN(CASE WHEN rna.assign_user_role IN ('rtm','rtm_superuser') THEN CAST(rna.cst_assigned_dtm AS DATE) END) AS first_record_assign_dt,
+           MAX(NVL(r.record_user_nm, CASE WHEN rna.assign_user_role IN ('rtm','rtm_superuser') THEN rna.assign_user_nm END)) AS record_user_nm,
+           MAX(CASE WHEN rn.note_type = 'Close case' THEN rn.note_part1 END) AS reason_closed,
+           MIN(CASE WHEN rna.assign_user_role IN ('scheduler','scheduler_superuser') THEN CAST(rna.cst_assigned_dtm AS DATE) END) AS first_scheduler_assign_dt,
+           MAX(NVL(r.scheduler_user_nm, CASE WHEN rna.assign_user_role IN ('scheduler','scheduler_superuser') THEN rna.assign_user_nm END)) AS scheduler_user_nm_req,
+
+           MAX(CASE WHEN rna.assign_user_role IN ('monitor','monitor_superuser') THEN rna.assign_user_nm END) AS monitor_user_nm_req,
+           MIN(CASE WHEN rna.assign_user_role IN ('monitor','monitor_superuser') THEN CAST(rna.cst_assigned_dtm AS DATE) END) AS first_monitor_assign_dt,
+           MAX(CASE WHEN rn.user_role IN ('rtm','rtm_superuser') THEN rn.facility_nm END) AS facility_nm,
+           MAX(CASE WHEN rn.note_type = 'Add contact' AND rn.user_role IN ('intake','intake_super','caller','caller_super') AND rn.reach_action IN ('Phone Conversation','Full story') THEN 1 ELSE 0 END) AS intake_caller_successful_contact_note_ind,
+           MAX(CASE WHEN rn.note_type = 'Add contact' AND rn.reach_action IN ('Phone Conversation','Full story') THEN 1 ELSE 0 END) AS successful_contact_note_ind,
+           MAX(CASE WHEN rn.note_type = 'Close case' THEN CAST(rn.cst_note_entered_dtm AS DATE) END) AS close_date,
+
+           MAX(CASE WHEN rn.note_type = 'Add contact' AND rn.user_role IN ('mtm','careteam_superuser') AND rn.reach_action IN ('Phone Conversation','Full story') THEN 1 ELSE 0 END) AS nurse_successfull_phone_contact,
+           MAX(CASE WHEN rn.note_type = 'Follow up action' AND rn.user_role IN ('mtm','careteam_superuser') THEN 1 ELSE 0 END) AS nurse_follow_up_note,
+           MAX(rn1.last_rtm_contact_note_dt) AS last_rtm_contact_note_dt,
+           MAX(CASE WHEN rn1.close_cnt > rn1.open_cnt OR (r.svc_cnt > 0 AND r.svc_opn_cnt = 0) OR (r.svc_type = 'PLS' AND r.status = 'delivered') THEN 1 ELSE 0 END) AS close_ind,
+           MAX(CASE WHEN r.is_reach_flg = true AND lower(rn.reach_action) IN ('phone conversation','full story','no voicemail','voicemail','text','in app message') THEN 1 ELSE 0 END) AS called_ind,
+           MAX(CASE WHEN r.is_reach_flg = true AND lower(rn.reach_action) IN ('phone conversation','full story') THEN 1 ELSE 0 END) AS conversation_ind,
+           MAX(CASE WHEN r.is_reach_flg = true AND lower(r.status) IN ('closed -doesn`t trust 2nd.md','closed -not interested','delivered','in progress - assigned') THEN 1 ELSE 0 END) AS conversation_qualified_ind,
+           MAX(CASE WHEN r.is_reach_flg = true AND lower(rn.reach_action) IN ('full story') THEN 1 ELSE 0 END) AS full_story_ind,
+           MAX(CASE WHEN r.is_reach_flg = true AND lower(rn.note_type) IN ('assign mtm','assign pls','assign pls nurse') THEN 1 ELSE 0 END) AS enrolled_transfered_ind
+    FROM  prod.emo_restricted.request r
+         LEFT JOIN prod.emo_edw.request_dtm_tracker rdt ON rdt.request_id = r.request_id
+         LEFT JOIN prod.emo_restricted.request_note rn ON rn.request_id = r.request_id
+         LEFT JOIN (SELECT request_id,
+                           COUNT(DISTINCT CASE WHEN note_type = 'Close case' THEN request_note_id END) AS close_cnt,
+                           COUNT(DISTINCT CASE WHEN note_type = 'Reopen case' THEN request_note_id END) AS open_cnt,
+                           MAX(CASE WHEN user_role IN ('rtm','rtm_superuser') AND note_type IN ('Regular note','Facility Note','Add contact') THEN CAST(cst_note_entered_dtm AS DATE) END) AS last_rtm_contact_note_dt
+                    FROM prod.emo_restricted.request_note
+                    GROUP BY request_id) rn1 ON rn1.request_id = r.request_id
+         LEFT JOIN dev.emo_edw.request_note_assign rna ON rna.request_id = r.request_id
+    WHERE CAST(r.cst_request_dtm AS DATE) >= '2024-01-01'
+    GROUP BY r.request_id
+)
+SELECT agg.*,
+       CASE WHEN caller_user_nm_req ILIKE '%test%' OR intake_user_nm_req ILIKE '%test%' THEN 1 ELSE 0 END AS intake_caller_test_user
+FROM agg;
+
+
+-- =====================================================================
+-- 3. Services
+-- =====================================================================
+CREATE OR REPLACE TEMPORARY VIEW services AS
+SELECT r.request_id AS service_req_id,
+       MAX(CASE WHEN r.contact_made_flg = 'true' THEN 1 ELSE 0 END) AS contact_made,
+       MAX(CASE WHEN r.is_reach_flg = 'true' THEN 'Outbound' ELSE 'Inbound' END) AS request_direction,
+       MAX(CASE WHEN r.mbr_disassociated_at_request_flg = 'true' THEN 1 ELSE 0 END) AS mbr_disassociated_at_request,
+       MAX(CASE WHEN (r.roi_sent_flg = 'true' OR COALESCE(rdt.cst_roi_first_signed_dtm, rdt.cst_scheduler_first_assign_dtm, sched.cst_specialist_select_dtm) IS NOT NULL) THEN 1 ELSE 0 END) AS roi_sent,
+       MAX(CASE WHEN COALESCE(rdt.cst_roi_first_signed_dtm, rdt.cst_scheduler_first_assign_dtm, sched.cst_specialist_select_dtm) IS NOT NULL THEN 1 ELSE 0 END) AS roi_signed,
+       MAX(CASE WHEN sched.cst_ready_for_schd_dtm IS NOT NULL THEN 1 ELSE 0 END) AS ready_for_schedule_ind,
+       MAX(con.record_retrieval_tm) AS record_retrieval_tm,
+       MAX(CASE WHEN con.cst_consult_dtm IS NOT NULL THEN 1 ELSE 0 END) AS scheduled_appt_ind,
+       MAX(CASE WHEN con.cst_consult_dtm IS NOT NULL AND con.cst_canceled_dtm IS NULL AND con.cst_admin_consult_end_dtm IS NULL THEN 1 ELSE 0 END) AS con_waiting_ind,
+       MAX(CASE WHEN con.cst_admin_consult_end_dtm IS NOT NULL AND con.cst_canceled_dtm IS NULL THEN 1 ELSE 0 END) AS completed_appt_ind,
+       MIN(CASE WHEN con.cst_admin_consult_end_dtm IS NOT NULL AND con.cst_canceled_dtm IS NULL THEN CAST(con.cst_admin_consult_end_dtm AS DATE) END) AS first_completed_appt_date,
+       COUNT(DISTINCT CASE WHEN con.cst_consult_dtm IS NOT NULL THEN con.appt_id END) AS scheduled_appt_count,
+       COUNT(DISTINCT CASE WHEN con.consult_billable_flg = 'true' THEN con.appt_id END) AS billable_appt_count,
+       MAX(CASE WHEN scn.scn_id IS NOT NULL AND scn.scn_delivered_flg = 'true' THEN 1 ELSE 0 END) AS scn_delivered_ind,
+       MAX(CASE WHEN pls.pls_id IS NOT NULL AND pls.pls_delivered_flg = 'true' THEN 1 ELSE 0 END) AS pls_delivered_ind,
+       MAX(pls.researcher_nm) AS pls_user_nm,
+       MAX(csa.consult_quality_user_id) AS consults_quality_user_id,
+       MAX(csa.consult_quality_user_nm) AS consult_quality_user_nm,
+       MAX(csa.consult_draft_user_id) AS consults_draft_user_id,
+       MAX(csa.consult_draft_user_nm) AS consult_draft_user_nm,
+       MAX(CASE WHEN csa.consult_draft_dt IS NOT NULL THEN 1 ELSE 0 END) AS cs_draft_ind,
+       MAX(csa.consult_draft_dt) AS impact_draft_dt,
+       MAX(csa.consult_quality_dt) AS consults_quality_dt,
+       MAX(CASE WHEN con.outcome = 'EMO Delivered' THEN rcs.final_cost_saving_amt END) AS emo_savings,
+       MAX(CASE WHEN con.outcome = 'EMO Delivered' THEN 1 ELSE 0 END) AS deliver_ind,
+       MAX(CASE WHEN con.canceled_24hrs_flg = 'true' OR con.member_no_show_flg = 'true' THEN 1 ELSE 0 END) AS cancel_ind,
+       MAX(CASE WHEN con.consult_billable_flg = 'true' THEN CAST(con.cst_consult_dtm AS DATE) END) AS utilization_dt,
+       MIN(CASE WHEN r.record_required = 'yes - 2nd.MD to obtain'
+                THEN LEAST(CAST(rdt.cst_roi_last_signed_dtm AS DATE), CAST(rr.cst_last_record_dtm AS DATE),
+                           CAST(rdt.cst_scheduler_first_assign_dtm AS DATE), CAST(sched.cst_specialist_select_dtm AS DATE),
+                           CAST(sched.cst_first_specialist_avail_dtm AS DATE), CAST(con.cst_consult_dtm AS DATE)) END) AS first_roi_signed_dt,
+       MAX(CASE WHEN r.record_required = 'yes - 2nd.MD to obtain' AND (r.record_cnt = r.record_received_cnt OR con.cst_consult_dtm IS NOT NULL)
+                THEN LEAST(CAST(rr.cst_last_record_dtm AS DATE), CAST(sched.cst_first_specialist_avail_dtm AS DATE), CAST(con.cst_consult_dtm AS DATE))
+           END) AS record_complete_dt,
+       MIN(CASE WHEN r.record_required = 'yes - 2nd.MD to obtain' THEN CAST(rdt.cst_roi_sent_dtm AS DATE) END) AS orig_roi_sent_dt,
+       MIN(CASE WHEN r.record_required = 'yes - 2nd.MD to obtain' THEN CAST(rdt.cst_roi_last_signed_dtm AS DATE) END) AS orig_roi_signed_dt,
+       MAX(sched.tat_specialist_avail_to_consult_day) AS tat_specialist_avail_to_consult_day,
+       MIN(CAST(sched.cst_ready_for_schd_dtm AS DATE)) AS ready_for_schedule_dt,
+       MIN(CAST(sched.cst_specialist_recommend_sent_dtm AS DATE)) AS specialist_recommend_sent_dt,
+       MIN(CAST(sched.cst_specialist_avail_recd_dtm AS DATE)) AS specialist_avail_recd_dt,
+       MIN(CAST(sched.cst_specialist_select_dtm AS DATE)) AS first_specialist_select_dt,
+       MIN(CAST(sched.cst_first_specialist_avail_dtm AS DATE)) AS orig_specialist_first_available_dt,
+       MIN(NVL(CAST(sched.cst_first_specialist_avail_dtm AS DATE), CAST(con.cst_consult_dtm AS DATE))) AS specialist_first_available_dt,
+       MIN(CAST(sched.cst_scheduled_on_dtm AS DATE)) AS first_scheduled_on_dt,
+
+       MAX(CASE WHEN con.outcome = 'EMO Delivered' THEN rf.mbr_nps_aggregate_score END) AS nps,
+       MAX(CASE WHEN con.outcome = 'EMO Delivered' AND rf.mbr_nps_response_flg = 'true' THEN 1 ELSE 0 END) AS nps_reponse,
+       MAX(CASE WHEN con.outcome = 'EMO Delivered' AND rf.csat_response_flg = 'true' THEN 1 ELSE 0 END) AS csat_reponse,
+       MAX(CASE WHEN con.outcome = 'EMO Delivered' AND rf.csat_satisfied_flg = 'true' THEN 1 ELSE 0 END) AS csat_satisfy,
+       MAX(prog.progress) AS request_progress,
+       MAX(CASE WHEN fu_date.request_id IS NOT NULL AND fu_date.cst_amend_ltfu_dtm IS NULL AND fu_date.cst_revert_ltfu_dtm IS NULL THEN 1 ELSE 0 END) AS ltfu_ind,
+       MAX(CAST(fu_date.cst_first_complete_fu_dtm AS DATE)) AS first_fu_complete_date,
+       MAX(CAST(fu_date.cst_first_complete_ltfu_dtm AS DATE)) AS first_ltfu_complete_date,
+       MIN(CAST(rr.cst_requested_dtm AS DATE)) AS record_requested_date,
+       MAX(CAST(rr.cst_received_dtm AS DATE)) AS record_received_date
+FROM prod.emo_restricted.request r
+     LEFT JOIN prod.emo_edw.request_dtm_tracker rdt ON rdt.request_id = r.request_id
+     LEFT JOIN prod.emo_edw.request_service svc ON svc.request_id = r.request_id
+     LEFT JOIN prod.emo_edw.request_schedule sched ON sched.request_id = r.request_id
+     LEFT JOIN prod.emo_edw.request_consult con ON svc.svc_id = con.svc_id
+     LEFT JOIN prod.emo_edw.request_scn scn ON scn.svc_id = svc.svc_id
+     LEFT JOIN prod.emo_edw.request_pls pls ON pls.svc_id = svc.svc_id
+     LEFT JOIN prod.emo_edw.request_cost_saving_agg csa ON csa.request_id = r.request_id
+     LEFT JOIN prod.emo_edw.request_cost_saving rcs ON rcs.svc_id = svc.svc_id AND rcs.svc_nm = 'consult'
+     LEFT JOIN prod.emo_edw.request_record rr ON rr.request_id = r.request_id
+     LEFT JOIN prod.emo_edw.request_feedback rf ON rf.request_id = r.request_id
+     LEFT JOIN prod.emo_edw.request_status prog ON prog.request_id = r.request_id
+     LEFT JOIN prod.emo_edw.request_ltfu_dtm_tracker fu_date ON fu_date.request_id = r.request_id
+WHERE CAST(r.cst_request_dtm AS DATE) >= '2023-01-01'
+GROUP BY r.request_id;
+
+
+-- =====================================================================
+-- 4. Member / corporate
+-- =====================================================================
+CREATE OR REPLACE TEMPORARY VIEW member_corp AS
+SELECT r.request_id AS mem_corp_req_id,
+       MAX(m.member_type) AS member_type,
+       MAX(c.org_channel) AS channel,
+       MAX(c.parent_id) AS pcorp_id,
+       MAX(c.org_parent_internal_nm) AS parent_name,
+       MAX(c.org_internal_nm) AS corp_name,
+       MAX(r.corporate_id) AS corp_id,
+       MAX(c.mbr_lvl_access) AS member_level_access,
+       MIN(CAST(c.cst_go_live_dtm AS DATE)) AS corp_go_live_date,
+       MIN(CAST(c.cst_decommission_dtm AS DATE)) AS corp_decommission_date,
+       MAX(CASE WHEN c.reach_enabled_flg = 'true' THEN 'Yes' ELSE 'No' END) AS reach_enabled,
+       MAX(CASE WHEN c.reach_paused_flg = 'true' THEN 'Yes' ELSE 'No' END) AS reach_paused,
+       MAX(CASE WHEN c.send_marketing_email_flg = 'true' THEN 'Yes' ELSE 'No' END) AS marketing_flg,
+       MAX(CASE WHEN c.reach_daily_email_flg = 'true' THEN 'Yes' ELSE 'No' END) AS reach_email_flg,
+       MAX(cs.billing_grp) AS billing_grp,
+       MAX(m.activation_status) AS activation_status,
+       MAX(md.do_not_sms_phone_num) AS do_not_allow_text,
+       MAX(m.emo_global_id) AS emo_global_id,
+       MAX(CASE WHEN md.unsubscribed_flg = 'true' THEN 'Yes' ELSE 'No' END) AS unscribed_flg,
+       MAX(CASE WHEN mcd.elig_mismatch_flg = 'true' THEN 1 ELSE 0 END) AS mbr_elig_mismatch,
+       MAX(m.current_elig_status) AS eligible_status,
+       MAX(CASE WHEN r.is_reach_flg = true AND mcd.elig_mismatch_flg = true THEN 1 ELSE 0 END) AS qualified_ind,
+       MAX(c.enc_key) AS enc_key,
+       MAX(m.person_id) AS person_id,
+       MAX(m.gender) AS gender
+FROM prod.emo_restricted.request r
+     LEFT JOIN prod.emo_edw.request_dtm_tracker rdtm ON rdtm.request_id = r.request_id
+     LEFT JOIN prod.emo_restricted.member m ON m.emo_unique_id = r.emo_unique_id
+     LEFT JOIN prod.emo_edw.corporate c ON c.corporate_id = r.corporate_id
+     LEFT JOIN prod.emo_edw.corporate_service cs ON cs.corporate_id = r.corporate_id
+     LEFT JOIN prod.emo_edw.member_corp_data mcd ON mcd.emo_unique_id = r.emo_unique_id
+     LEFT JOIN prod.emo_edw.member_demographic md ON md.emo_unique_id = r.emo_unique_id
+WHERE CAST(r.cst_request_dtm AS DATE) >= '2024-01-01'
+GROUP BY r.request_id;
+
+
+-- =====================================================================
+-- 5. Final request table (layered CTEs replace same-SELECT alias references)
+-- =====================================================================
+DROP VIEW IF EXISTS request;
+CREATE OR REPLACE TEMPORARY VIEW request AS
+WITH base AS (
+    SELECT DISTINCT
+           r.request_id,
+           r.emo_unique_id,
+           CAST(r.cst_request_dtm AS DATE) AS original_request_date,
+           CAST(rdtm.cst_request_first_contact_dtm AS DATE) AS first_contact_dt,
+           r.status,
+           s.contact_made,
+           s.request_direction,
+           r.request_source AS request_source,
+           r.request_reason,
+           r.record_required,
+           mc.activation_status,
+           mc.emo_global_id,
+           mc.do_not_allow_text,
+           mc.unscribed_flg,
+           r.transfer_type AS transfer_type,
+           r.svc_type AS svc_type,
+           r.referral_user_nm,
+           r.referral_direction,
+           r.mdc_cat_1 AS mdc_cat_1,
+           r.mdc_skillset,
+           r.mdc_strat_cd,
+           r.mdc_strat_desc,
+           r.oreo_risk_lvl AS oreo_risk_lvl,
+           r.oreo_risk_detail,
+           r.oreo_predicted_probability,
+           r.surgery_recommended,
+           r.record_cnt,
+           r.record_approved_cnt,
+           r.record_received_cnt,
+           rcct.intake_msg_cnt,
+           rcct.intake_call_cnt,
+           rcct.reach_call_cnt,
+           rcct.nurse_msg_cnt,
+           rcct.nurse_call_cnt,
+           rcct.record_call_cnt,
+           rcct.record_facility_call_cnt,
+           rcct.record_msg_cnt,
+           rcct.scheduler_msg_cnt,
+           rcct.scheduler_call_cnt,
+
+           mc.member_type,
+           mc.channel,
+           mc.pcorp_id,
+           mc.parent_name,
+           mc.corp_id,
+           mc.corp_name,
+           mc.corp_go_live_date,
+           mc.corp_decommission_date,
+           mc.gender,
+           mc.reach_enabled,
+           mc.reach_paused,
+           mc.marketing_flg,
+           mc.reach_email_flg,
+           mc.billing_grp,
+           mc.member_level_access,
+           s.deliver_ind,
+           s.billable_appt_count,
+           s.cancel_ind,
+           s.pls_user_nm,
+           CASE WHEN (r.status NOT IN ('in progress') AND mc.mbr_elig_mismatch = 0) THEN 1 ELSE 0 END AS request_assigned,
+           CASE WHEN (r.status IN ('closed -Doesn`t trust 2nd.MD','in progress','bad request - Archive','bad request - Bad Request','bad request - Duplicate')
+                      OR (r.is_reach_flg = 'false' AND r.status IN ('closed ---','delivered') AND r.svc_type = 'PLS' AND r.nurse_user_nm IS NULL AND r.record_user_nm IS NULL))
+                THEN 0 ELSE 1 END AS conversion_ind,
+
+           s.nps,
+           s.nps_reponse,
+           s.csat_reponse,
+           s.csat_satisfy,
+           s.utilization_dt,
+           rn.first_nurse_assign_dt,
+           CASE WHEN r.record_required = 'yes - 2nd.MD to obtain' THEN 1 ELSE 0 END AS record_required_ind,
+           s.first_roi_signed_dt,
+           s.orig_roi_sent_dt,
+           s.orig_roi_signed_dt,
+           s.record_requested_date,
+           s.record_received_date,
+           s.record_complete_dt,
+           s.ready_for_schedule_dt,
+           s.specialist_recommend_sent_dt,
+           s.specialist_avail_recd_dt,
+           s.first_specialist_select_dt,
+           s.orig_specialist_first_available_dt,
+           s.specialist_first_available_dt,
+           s.first_scheduled_on_dt,
+           UPPER(rn.nurse_user_nm) AS nurse_user_nm,
+           rn.first_record_assign_dt AS first_record_assign_dt,
+           UPPER(rn.record_user_nm) AS record_user_nm,
+           rn.first_scheduler_assign_dt AS first_scheduler_assign_dt,
+           UPPER(rn.scheduler_user_nm_req) AS scheduler_user_nm,
+           rn.first_monitor_assign_dt AS first_monitor_assign_dt,
+           UPPER(rn.monitor_user_nm_req) AS monitor_user_nm,
+           s.emo_savings,
+           s.tat_specialist_avail_to_consult_day,
+           r.referral_type AS referral_type,
+           mc.person_id,
+
+           CASE WHEN NVL(rn.nurse_ind,0) = 1
+                 AND NVL(rn.nurse_successfull_phone_contact,0) = 0
+                 AND NVL(s.scheduled_appt_count,0) = 0
+                 AND NVL(rn.record_ind,0) = 0
+                 AND NVL(s.roi_signed,0) = 0
+                 AND NVL(s.scn_delivered_ind,0) = 0
+                 AND NVL(rn.nurse_follow_up_note,0) = 0
+                 AND r.status = 'closed -Unresponsive'
+                THEN 1 ELSE 0 END AS nurse_assign_unsuccessful_closed,
+
+           CASE WHEN NVL(rn.nurse_ind,0) = 1
+                 AND NVL(rn.nurse_successfull_phone_contact,0) = 0
+                 AND NVL(s.scheduled_appt_count,0) = 0
+                 AND NVL(rn.record_ind,0) = 0
+                 AND NVL(s.roi_signed,0) = 0
+                 AND NVL(s.scn_delivered_ind,0) = 0
+                 AND NVL(rn.nurse_follow_up_note,0) = 0
+                 AND r.status = 'in progress - assigned'
+                THEN 1 ELSE 0 END AS nurse_assign_unsuccessful_in_progress,
+
+           s.scheduled_appt_ind,
+           CASE WHEN rn.nurse_ind = 0 AND s.roi_signed = 0 AND s.scheduled_appt_ind = 0 AND r.status = 'in progress - assigned' THEN 1 ELSE 0 END AS request_inventory,
+           CASE WHEN rn.nurse_ind = 1 AND s.roi_signed = 0 AND s.scheduled_appt_ind = 0 AND r.status = 'in progress - assigned' THEN 1 ELSE 0 END AS nurse_inventory,
+           CASE WHEN s.roi_signed = 1 AND s.scheduled_appt_ind = 0 AND r.status = 'in progress - assigned' THEN 1 ELSE 0 END AS roi_inventory,
+           s.con_waiting_ind,
+           CASE WHEN rn.close_ind = 0
+                THEN CASE WHEN s.request_progress = 'Case Started' AND s.request_direction = 'Outbound' AND s.contact_made = 0 AND rn.caller_ind = 0 AND rn.nurse_ind = 0 AND rn.record_ind = 0 AND rn.pls_assign_ind = 0 AND mc.mbr_elig_mismatch = 0 AND s.mbr_disassociated_at_request = 0 THEN 'Outbound Unassigned'
+                          WHEN s.request_progress = 'Case Started' AND s.request_direction = 'Outbound' AND s.contact_made = 0 AND rn.caller_ind = 1 AND rn.nurse_ind = 0 AND rn.record_ind = 0 AND rn.pls_assign_ind = 0 AND mc.mbr_elig_mismatch = 0 AND s.mbr_disassociated_at_request = 0 THEN 'Outbound Assigned No Contact'
+                          WHEN s.request_progress = 'Case Started' AND s.contact_made = 1 AND rn.nurse_ind = 0 AND rn.pls_assign_ind = 0 AND mc.mbr_elig_mismatch = 0 AND s.mbr_disassociated_at_request = 0 THEN 'HA Contacting'
+                          WHEN s.request_progress = 'Case Started' AND rn.nurse_ind = 1 THEN 'Nurse Contacting'
+                          ELSE s.request_progress
+                     END
+           END AS inventory_status,
+           s.record_retrieval_tm,
+           s.roi_sent,
+           s.roi_signed,
+           rn.nurse_ind AS nurse_assigned,
+           s.scn_delivered_ind,
+           s.pls_delivered_ind,
+           rn.record_ind,
+           rn.nurse_follow_up_note,
+           rn.close_date,
+           rn.reason_closed,
+           rn.facility_nm,
+           s.first_completed_appt_date,
+           s.mbr_disassociated_at_request,
+           rn.intake_caller_successful_contact_note_ind,
+           rn.successful_contact_note_ind,
+           mc.mbr_elig_mismatch,
+           r.oreo_risk_detail AS oreo_risk_lvl_detail,
+           s.request_progress,
+           rn.close_ind,
+           rn.last_rtm_contact_note_dt,
+           rn.caller_ind,
+           rn.intake_ind,
+           UPPER(rn.caller_user_nm_req) AS caller_user_nm,
+           UPPER(rn.intake_user_nm_req) AS intake_user_nm,
+           rn.intake_caller_test_user,
+           r.referral_partner_nm,
+           CASE WHEN r.referral_partner_nm ILIKE ANY ('%carrum%','%surgery%','%sword%','%hinge%','%vivante%','%carrot%','%kindbody%','%virta%','%noom%','%rxss%','%folx%','%lyra%','%headspace%','%brightline%','%equip%')
+                THEN 1 ELSE 0 END AS referral_tpe_partner_ind,
+
+           CASE WHEN (r.referral_direction = 'outgoing' AND r.cst_referral_dtm IS NOT NULL)
+                  OR r.status = 'closed -Outgoing Referral'
+                  OR out_ref.outgoing_referral_note_date IS NOT NULL
+                THEN 1 ELSE 0 END AS outgoing_referral_ind,
+
+           out_ref.outgoing_referral_note_date,
+           out_ref.outgoing_referral_note_user_nm,
+           out_ref.outgoing_referral_note_user_role,
+           r.referral_partner_outbound_nm,
+           r.cst_referral_dtm,
+
+           CAST(r.cst_referral_dtm AS DATE) AS referral_date,
+           CAST(r.cst_referral_dtm AS DATE) AS request_referral_dt,
+           CASE WHEN r.is_reach_flg = true THEN 1 ELSE 0 END AS identified_ind,
+           mc.qualified_ind,
+           rn.full_story_ind,
+           rn.enrolled_transfered_ind,
+           rn.called_ind,
+           rn.conversation_ind,
+           rn.conversation_qualified_ind,
+           mc.enc_key,
+           r.referral_user_email AS referral_user_email,
+           s.consult_quality_user_nm
+    FROM prod.emo_restricted.request r
+         LEFT JOIN prod.emo_edw.request_dtm_tracker rdtm ON rdtm.request_id = r.request_id
+         LEFT JOIN prod.emo_edw.request_contact_cnt_tracker rcct ON rcct.request_id = r.request_id
+         LEFT JOIN out_ref ON out_ref.outgoing_referral_note_req_id = r.request_id
+         LEFT JOIN notes rn ON rn.notes_req_id = r.request_id
+         LEFT JOIN services s ON s.service_req_id = r.request_id
+         LEFT JOIN member_corp mc ON mc.mem_corp_req_id = r.request_id
+),
+l1 AS (
+    SELECT base.*,
+           date_format(first_contact_dt, 'yyyyMM') AS first_contact_month,
+           CASE WHEN weekofyear(first_contact_dt) > 4 AND month(first_contact_dt) = 1 THEN 1 ELSE weekofyear(first_contact_dt) END AS first_contact_week,
+           CASE WHEN nurse_assign_unsuccessful_closed = 1 OR nurse_assign_unsuccessful_in_progress = 1 THEN 1 ELSE 0 END AS nurse_assign_unsuccessful,
+
+           CASE WHEN outgoing_referral_ind = 1 AND referral_direction = 'outgoing'
+                    THEN COALESCE(CAST(outgoing_referral_note_date AS DATE), CAST(cst_referral_dtm AS DATE), CAST(close_date AS DATE))
+                WHEN outgoing_referral_ind = 1 AND referral_direction = 'incoming'
+                    THEN COALESCE(CAST(outgoing_referral_note_date AS DATE), CAST(close_date AS DATE))
+           END AS outgoing_referral_date,
+
+           CASE WHEN outgoing_referral_ind = 1 THEN NVL(outgoing_referral_note_user_nm, 'Unknown Referral User') END AS outgoing_referral_user_nm,
+           CASE WHEN outgoing_referral_ind = 1 THEN NVL(outgoing_referral_note_user_role, 'Unknown Referral User') END AS outgoing_referral_user_role,
+
+           CASE WHEN outgoing_referral_ind = 1 AND referral_direction = 'incoming'
+                    THEN NVL(referral_partner_outbound_nm, 'Unknown Referral Partner')
+                WHEN outgoing_referral_ind = 1
+                    THEN COALESCE(referral_partner_outbound_nm, referral_partner_nm, 'Unknown Referral Partner')
+           END AS outgoing_referral_partner,
+
+           CASE WHEN outgoing_referral_ind = 1 AND referral_direction = 'outgoing'
+                     AND referral_partner_nm ILIKE ANY ('%carrum%','%surgery%','%sword%','%hinge%','%vivante%','%carrot%','%kindbody%','%virta%','%noom%','%rxss%','%folx%','%lyra%','%headspace%','%brightline%','%equip%')
+                THEN 1 ELSE 0 END AS outgoing_referral_tpe_partner_ind
+    FROM base
+),
+l2 AS (
+    SELECT l1.*,
+           CASE WHEN outgoing_referral_partner ILIKE 'Cigna%'   THEN 'Cigna'
+                WHEN outgoing_referral_partner ILIKE 'Accolade%' THEN 'Accolade'
+                WHEN outgoing_referral_partner ILIKE 'Aetna%'   THEN 'Aetna'
+                WHEN outgoing_referral_partner ILIKE 'Anthem%'  THEN 'Anthem'
+                WHEN outgoing_referral_partner ILIKE 'BCBS%'    THEN 'BCBS'
+                WHEN outgoing_referral_partner ILIKE 'Bind%'    THEN 'Bind'
+                WHEN outgoing_referral_partner ILIKE 'Viacom%'  THEN 'Other'
+                WHEN outgoing_referral_partner ILIKE '%Optum%'  THEN 'Optum'
+                WHEN outgoing_referral_partner ILIKE 'UHC%'     THEN 'UHC'
+                WHEN outgoing_referral_partner ILIKE 'MyUHC%'   THEN 'UHC'
+                WHEN outgoing_referral_partner ILIKE 'Sedera%'  THEN 'Sedera'
+                WHEN outgoing_referral_partner IS NOT NULL      THEN 'Other'
+           END AS outgoing_referral_type
+    FROM l1
+)
+SELECT * EXCEPT (outgoing_referral_note_date, outgoing_referral_note_user_nm, outgoing_referral_note_user_role,
+                 referral_partner_outbound_nm, cst_referral_dtm)
+FROM l2;
+
+SELECT distinct request_id, first_contact_dt, utilization_dt, contact_made, status, request_direction, transfer_type, oreo_risk_lvl, oreo_predicted_probability, billable_appt_count, deliver_ind, conversation_ind, full_story_ind   FROM request where first_contact_dt between '2025-01-01' and '2026-10-31'
+                                                                                                                                                                                                                                                                                                                                                                                                         and conversion_ind = 1 and contact_made = 1  ;
